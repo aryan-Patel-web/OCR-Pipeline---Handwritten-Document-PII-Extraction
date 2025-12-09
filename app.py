@@ -1,385 +1,380 @@
 """
 app.py
-Streamlit frontend for MedicalDocumentOCR
-Dark theme UI similar to ChatGPT.
+Streamlit Frontend for Hybrid Medical OCR (Tesseract + TrOCR)
+Black / ChatGPT-style UI
 """
 
 import streamlit as st
+import numpy as np
 import cv2
 from PIL import Image
-import json
 import tempfile
 import os
+import json
 
 from main import MedicalDocumentOCR
 
-# ---------------------- PAGE CONFIG ---------------------- #
-
 st.set_page_config(
-    page_title="Medical OCR + PII Extractor",
-    page_icon="🏥",
+    page_title="Handwritten Medical OCR",
+    page_icon="🩺",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
+# ---------------------- DARK THEME CSS (BLACK UI) ---------------------- #
 
-# ---------------------- DARK THEME CSS ---------------------- #
-
-def apply_dark_theme():
+def apply_black_theme():
     st.markdown(
         """
-    <style>
+        <style>
+        /* Global */
         .stApp {
-            background-color: #1E1E1E;
-            color: #E0E0E0;
+            background-color: #000000;
+            color: #f1f1f1;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         }
 
+        /* Sidebar */
         [data-testid="stSidebar"] {
-            background-color: #2D2D2D;
+            background-color: #050505;
+            border-right: 1px solid #222;
         }
 
-        h1, h2, h3, h4, h5, h6 {
-            color: #FFFFFF !important;
-            font-weight: 600;
+        /* Titles */
+        h1, h2, h3, h4, h5 {
+            color: #ffffff !important;
+            font-weight: 700;
         }
 
-        p, span, label {
-            color: #E0E0E0;
+        /* Text */
+        p, span, label, li {
+            color: #e0e0e0 !important;
         }
 
-        .stTextInput > div > div > input,
-        .stTextArea > div > div > textarea {
-            background-color: #2D2D2D;
-            color: #E0E0E0;
-            border: 1px solid #404040;
-            border-radius: 8px;
-        }
-
-        .stButton > button {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            border-radius: 8px;
-            padding: 0.75rem 2rem;
-            font-weight: 600;
-            transition: all 0.3s ease;
-            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
-        }
-
-        .stButton > button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.6);
-        }
-
-        [data-testid="stFileUploader"] {
-            background-color: #2D2D2D;
-            border: 2px dashed #667eea;
-            border-radius: 12px;
-            padding: 2rem;
-        }
-
-        .custom-card {
-            background: linear-gradient(135deg, #2d2d2d 0%, #1e1e1e 100%);
+        /* Cards */
+        .card {
+            background: #111111;
             border-radius: 16px;
-            padding: 2rem;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
-            border: 1px solid #404040;
-            margin-bottom: 1.5rem;
+            padding: 1.5rem;
+            border: 1px solid #262626;
+            box-shadow: 0 0 0 1px #111;
         }
 
-        .gradient-header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            font-size: 3rem;
-            font-weight: 800;
-            text-align: center;
-            margin-bottom: 2rem;
-        }
-
-        .pii-badge {
-            display: inline-block;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 0.4rem 0.9rem;
-            border-radius: 999px;
-            margin: 0.15rem;
+        .card-header {
+            font-size: 1.1rem;
             font-weight: 600;
-            font-size: 0.85rem;
+            margin-bottom: 0.75rem;
         }
 
+        /* Buttons */
+        .stButton > button {
+            background: linear-gradient(135deg, #10b981, #0ea5e9);
+            color: white;
+            border-radius: 999px;
+            border: none;
+            padding: 0.45rem 1.4rem;
+            font-weight: 600;
+            font-size: 0.95rem;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .stButton > button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 10px 25px rgba(16,185,129,0.45);
+        }
+
+        /* File uploader: smaller, minimal look */
+        [data-testid="stFileUploader"] > div:nth-child(1) {
+            padding: 0.4rem 0.75rem;
+            border-radius: 999px;
+            border: 1px solid #333;
+            background: #111;
+        }
+        [data-testid="stFileUploader"] section {
+            padding: 0.4rem 0;
+        }
+        [data-testid="stFileUploader"] label {
+            font-size: 0.9rem !important;
+        }
+
+        /* Tabs */
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 4px;
+            background: #050505;
+            border-radius: 999px;
+            padding: 4px;
+        }
+        .stTabs [data-baseweb="tab"] {
+            color: #a3a3a3;
+            border-radius: 999px;
+            padding-top: 0.25rem;
+            padding-bottom: 0.25rem;
+        }
+        .stTabs [aria-selected="true"] {
+            background: #111111;
+            color: #f9fafb !important;
+            box-shadow: 0 0 0 1px #1f2937;
+        }
+
+        /* Metrics */
+        [data-testid="stMetricValue"] {
+            color: #22c55e;
+            font-weight: 700;
+        }
+        [data-testid="stMetricLabel"] {
+            color: #9ca3af;
+        }
+
+        /* Text area */
+        textarea {
+            background-color: #050505 !important;
+            color: #e5e7eb !important;
+            border-radius: 10px !important;
+            border: 1px solid #27272a !important;
+        }
+
+        /* Scrollbar */
         ::-webkit-scrollbar {
-            width: 10px;
-            height: 10px;
+            width: 8px;
+            height: 8px;
         }
         ::-webkit-scrollbar-track {
-            background: #1E1E1E;
+            background: #050505;
         }
         ::-webkit-scrollbar-thumb {
-            background: #667eea;
-            border-radius: 5px;
+            background: #444;
+            border-radius: 999px;
         }
         ::-webkit-scrollbar-thumb:hover {
-            background: #764ba2;
+            background: #666;
         }
-    </style>
-    """,
+
+        /* Small caption text */
+        .caption {
+            font-size: 0.8rem;
+            color: #9ca3af;
+        }
+
+        /* Gradient header text */
+        .gradient-title {
+            background: linear-gradient(120deg, #22c55e, #06b6d4, #a855f7);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: 800;
+            font-size: 2.3rem;
+            text-align: center;
+            margin-bottom: 0.3rem;
+        }
+        .subtitle {
+            text-align: center;
+            color: #9ca3af;
+            font-size: 0.95rem;
+            margin-bottom: 1.8rem;
+        }
+
+        </style>
+        """,
         unsafe_allow_html=True,
     )
 
 
-apply_dark_theme()
-
+apply_black_theme()
 
 # ---------------------- SESSION STATE ---------------------- #
+
+if "ocr_engine" not in st.session_state:
+    st.session_state.ocr_engine = MedicalDocumentOCR()
 
 if "results" not in st.session_state:
     st.session_state.results = None
 
-
 # ---------------------- HEADER ---------------------- #
 
+st.markdown('<div class="gradient-title">Handwritten Medical OCR</div>', unsafe_allow_html=True)
 st.markdown(
-    '<h1 class="gradient-header">🏥 Medical Document OCR + PII Extractor</h1>',
-    unsafe_allow_html=True,
-)
-st.markdown(
-    '<p style="text-align: center; font-size: 1.1rem; color: #B0B0B0; margin-bottom: 2rem;">Advanced preprocessing + OCR tuned for handwritten hospital records (double-page, progress notes, charts)</p>',
+    '<div class="subtitle">Hybrid Tesseract + TrOCR engine for tough hospital documents (raw text only)</div>',
     unsafe_allow_html=True,
 )
 
-
-# ---------------------- SIDEBAR ---------------------- #
+# ---------------------- SIDEBAR (SETTINGS) ---------------------- #
 
 with st.sidebar:
-    st.markdown("### ⚙️ Preprocessing Settings")
+    st.markdown("### ⚙️ Pipeline Settings")
     st.markdown("---")
 
-    deskew = st.checkbox("Auto-deskew tilted pages", value=True)
-    denoise = st.checkbox("Denoise background", value=True)
-    enhance_contrast = st.checkbox("Enhance contrast (CLAHE)", value=True)
+    use_tesseract = st.checkbox("Use Tesseract (printed text)", value=True)
+    use_trocr = st.checkbox("Use TrOCR (handwriting)", value=True)
+
+    st.markdown("### 🧪 Preprocessing")
+    deskew = st.checkbox("Deskew pages", value=True)
+    denoise = st.checkbox("Denoise", value=True)
+    enhance = st.checkbox("Enhance contrast", value=True)
+
+    st.markdown("### ✂️ TrOCR Grid")
+    rows = st.slider("Grid rows", 1, 4, 3)
+    cols = st.slider("Grid cols", 1, 4, 2)
 
     st.markdown("---")
-    st.markdown("#### ℹ️ Assignment Notes")
-    st.info(
-        """
-**Pipeline:**  
-Input (handwritten JPEG) → Pre-processing → OCR → Text Cleaning →  
-PII + structured extraction → Optional redacted image.
-
-Optimized for:  
-• Slight tilt  
-• Doctor handwriting  
-• Double-page scanned forms
-"""
+    st.markdown("### ℹ️ Info")
+    st.caption(
+        "TrOCR is a handwriting transformer model. "
+        "We split the page into tiles and OCR each tile to capture even faint pen strokes."
     )
 
-    st.markdown("---")
-    st.markdown("#### 🔒 Privacy")
-    st.warning("All processing is **local only**. No data leaves your machine.")
-
+# Update engine config from sidebar
+st.session_state.ocr_engine.use_tesseract = use_tesseract
+st.session_state.ocr_engine.use_trocr = use_trocr
+st.session_state.ocr_engine.deskew = deskew
+st.session_state.ocr_engine.denoise = denoise
+st.session_state.ocr_engine.enhance_contrast = enhance
+st.session_state.ocr_engine.trocr_grid_rows = rows
+st.session_state.ocr_engine.trocr_grid_cols = cols
 
 # ---------------------- MAIN LAYOUT ---------------------- #
 
-col_left, col_right = st.columns([1, 1])
+left_col, right_col = st.columns([1, 1])
 
-with col_left:
-    st.markdown('<div class="custom-card">', unsafe_allow_html=True)
-    st.markdown("### 📤 Upload Handwritten Medical Document")
+# ---------- LEFT: IMAGE + RUN BUTTON ---------- #
 
-    uploaded_file = st.file_uploader(
-        "Upload JPEG/PNG medical notes or hospital forms",
+with left_col:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="card-header">📤 Upload document</div>', unsafe_allow_html=True)
+
+    uploaded = st.file_uploader(
+        "JPEG/PNG medical document",
         type=["jpg", "jpeg", "png"],
-        help="Use clear scans or photos; double-page images are supported.",
+        label_visibility="collapsed",
     )
 
-    if uploaded_file is not None:
-        image = Image.open(uploaded_file)
-        st.image(image, caption="Uploaded Document", use_column_width=True)
+    if uploaded is not None:
+        img = Image.open(uploaded).convert("RGB")
+        st.image(img, caption="Original scan", use_container_width=True)
 
-        if st.button("🚀 Run OCR + PII Extraction", use_container_width=True):
-            with st.spinner("Processing document with advanced OCR..."):
-                with tempfile.NamedTemporaryFile(
-                    delete=False, suffix=".jpg"
-                ) as tmp_file:
-                    tmp_file.write(uploaded_file.getvalue())
-                    tmp_path = tmp_file.name
+        run = st.button("🔍 Run Hybrid OCR", use_container_width=True)
+        if run:
+            with st.spinner("Processing with Tesseract + TrOCR..."):
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+                    tmp.write(uploaded.getvalue())
+                    tmp_path = tmp.name
 
                 try:
-                    ocr = MedicalDocumentOCR(
-                        deskew=deskew,
-                        denoise=denoise,
-                        enhance_contrast=enhance_contrast,
-                    )
-                    results = ocr.process_document(tmp_path)
-                    st.session_state.results = results
-                    st.success("✅ Processing complete!")
+                    res = st.session_state.ocr_engine.process_document(tmp_path)
+                    st.session_state.results = res
+                    st.success("✅ OCR completed")
                 except Exception as e:
-                    st.error(f"❌ Error during processing: {e}")
+                    st.error(f"Error while running OCR: {e}")
                 finally:
                     if os.path.exists(tmp_path):
                         os.unlink(tmp_path)
 
     else:
-        st.info("⬆️ Upload a handwritten medical JPEG/PNG to begin.")
+        st.caption("Upload a scan on the right button to start.")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-with col_right:
-    st.markdown('<div class="custom-card">', unsafe_allow_html=True)
-    st.markdown("### 📊 Extraction Results")
+# ---------- RIGHT: RESULTS ---------- #
+
+with right_col:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="card-header">📊 OCR Results</div>', unsafe_allow_html=True)
 
     results = st.session_state.results
+
     if results is None:
-        st.info("Results will appear here after you process a document.")
+        st.info("No document processed yet. Upload on the left and click **Run Hybrid OCR**.")
+        st.markdown("</div>", unsafe_allow_html=True)
     else:
-        # Top metrics
+        # Metrics row
         c1, c2, c3 = st.columns(3)
         with c1:
-            st.metric("PII Items Found", results["summary"]["total_pii_found"])
+            st.metric("Pages", results["summary"]["pages_detected"])
         with c2:
-            st.metric("PII Categories", len(results["summary"]["pii_categories"]))
+            st.metric("PII Items", results["summary"]["total_pii_found"])
         with c3:
-            st.metric("Pages Detected", results["summary"]["pages_detected"])
+            st.metric("Text Length", len(results["combined_text_all"]))
 
-        tab1, tab2, tab3, tab4 = st.tabs(
-            ["🔍 Structured Fields", "📝 Text & PII", "🖼️ Redacted Image", "📥 Download"]
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(
+            ["📝 Combined Text", "📄 Per Page", "🔒 PII Summary", "🖼️ Redacted Image", "📥 Download"]
         )
 
-        # -------- Structured Fields per Page -------- #
+        # --- Tab 1: Combined text (raw) --- #
         with tab1:
-            st.markdown("#### Per-page structured extraction")
-            for page in results.get("pages", []):
-                side = page.get("side", "page")
-                fields = page.get("fields", {})
-                st.markdown(f"##### 📄 {side.upper()} PAGE")
+            st.markdown("#### Combined OCR Output (Tesseract + TrOCR)")
+            st.text_area(
+                label="",
+                value=results["combined_text_all"],
+                height=420,
+            )
 
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    st.markdown("**Header / Patient Info**")
-                    st.write("Hospital:", fields.get("hospital_name") or "—")
-                    st.write("Location:", fields.get("location") or "—")
-                    st.write("Form Code:", fields.get("form_code") or "—")
-                    st.write("Patient Name:", fields.get("patient_name") or "—")
-                    st.write("Age:", fields.get("age") or "—")
-                    st.write("Sex:", fields.get("sex") or "—")
-                    st.write("IPD No.:", fields.get("ipd_number") or "—")
-                    st.write("UHID No.:", fields.get("uhid_number") or "—")
-                    st.write("Bed No.:", fields.get("bed_number") or "—")
-                    st.write("Date:", fields.get("date") or "—")
-                    st.write("Time:", fields.get("time") or "—")
-
-                with col_b:
-                    st.markdown("**Vitals**")
-                    vitals = fields.get("vitals", {}) or {}
-                    st.write("BP:", vitals.get("bp") or "—")
-                    st.write("PR:", vitals.get("pr") or "—")
-                    st.write("RR:", vitals.get("rr") or "—")
-                    st.write("Temp:", vitals.get("temp") or "—")
-
-                    st.markdown("**Clinical Summary**")
-                    cs = fields.get("clinical_summary") or "—"
-                    st.write(cs)
-
+        # --- Tab 2: Per-page view --- #
+        with tab2:
+            for page in results["pages"]:
+                st.markdown(f"#### Page: `{page['side']}`")
+                colp1, colp2 = st.columns(2)
+                with colp1:
+                    st.markdown("**Tesseract (printed)**")
+                    st.text_area(
+                        label=f"Tesseract - {page['side']}",
+                        value=page["tesseract_text"],
+                        height=200,
+                    )
+                with colp2:
+                    st.markdown("**TrOCR (handwriting)**")
+                    st.text_area(
+                        label=f"TrOCR - {page['side']}",
+                        value=page["trocr_text"],
+                        height=200,
+                    )
                 st.markdown("---")
 
-        # -------- PII + Text -------- #
-        with tab2:
-            sub1, sub2 = st.columns([1, 1])
-            with sub1:
-                st.markdown("#### Extracted PII tokens (for redaction)")
-                pii = results.get("pii_extracted", {})
-                for cat, vals in pii.items():
+        # --- Tab 3: PII Summary --- #
+        with tab3:
+            st.markdown("#### Detected PII (regex-based)")
+            pii = results["pii"]
+            if not any(pii.values()):
+                st.info("No PII-like patterns detected.")
+            else:
+                for key, vals in pii.items():
                     if not vals:
                         continue
-                    st.markdown(f"**{cat.replace('_', ' ').title()}:**")
-                    for v in vals:
-                        st.markdown(
-                            f'<span class="pii-badge">{v}</span>',
-                            unsafe_allow_html=True,
-                        )
-                    st.markdown("")
+                    st.markdown(f"**{key}**")
+                    st.write(", ".join(vals))
 
-            with sub2:
-                st.markdown("#### Cleaned OCR Text (all pages)")
-                st.text_area(
-                    label="",
-                    value=results.get("cleaned_text", ""),
-                    height=400,
-                )
-
-        # -------- Redacted Image -------- #
-        with tab3:
-            if results.get("redacted_image") is not None:
-                st.markdown("#### Redacted document preview")
-                bgr = results["redacted_image"]
-                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                st.image(
-                    Image.fromarray(rgb),
-                    caption="Redacted image (PII blocked)",
-                    use_column_width=True,
-                )
-            else:
-                st.info("Redacted image not available for this document.")
-
-        # -------- Downloads -------- #
+        # --- Tab 4: Redacted Image --- #
         with tab4:
-            st.markdown("#### Download structured output")
+            st.markdown("#### Redacted Image (PII hidden where possible)")
+            red = results["redacted_image"]
+            if red is None:
+                st.info("Redacted image unavailable.")
+            else:
+                red_rgb = cv2.cvtColor(red, cv2.COLOR_BGR2RGB)
+                st.image(red_rgb, caption="Redacted Image", use_container_width=True)
 
-            export = {
-                "timestamp": results["timestamp"],
-                "image_path": results["image_path"],
-                "pages": results["pages"],
-                "cleaned_text": results["cleaned_text"],
-                "pii_extracted": results["pii_extracted"],
-                "summary": results["summary"],
-            }
+        # --- Tab 5: Download --- #
+        with tab5:
+            st.markdown("#### Download OCR Output")
 
+            txt = results["combined_text_all"]
             st.download_button(
-                label="📄 Download JSON report",
-                data=json.dumps(export, indent=2),
-                file_name=f"ocr_results_{results['timestamp']}.json",
+                label="📄 Download Full Text (.txt)",
+                data=txt.encode("utf-8"),
+                file_name=f"ocr_text_{results['timestamp']}.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
+
+            json_payload = {
+                "timestamp": results["timestamp"],
+                "summary": results["summary"],
+                "pii": results["pii"],
+                "pages": results["pages"],
+            }
+            st.download_button(
+                label="🧾 Download JSON (.json)",
+                data=json.dumps(json_payload, indent=2),
+                file_name=f"ocr_json_{results['timestamp']}.json",
                 mime="application/json",
                 use_container_width=True,
             )
 
-            if results.get("redacted_image") is not None:
-                _, buf = cv2.imencode(".jpg", results["redacted_image"])
-                st.download_button(
-                    label="🖼️ Download redacted image (JPG)",
-                    data=buf.tobytes(),
-                    file_name=f"redacted_{results['timestamp']}.jpg",
-                    mime="image/jpeg",
-                    use_container_width=True,
-                )
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-# ---------------------- FEATURES ROW ---------------------- #
-
-st.markdown("---")
-st.markdown("### 🎯 What this pipeline does for your assignment")
-
-c1, c2, c3, c4 = st.columns(4)
-c1.markdown(
-    "<div style='text-align:center;'><h3>📄</h3><b>Double-page aware</b><br/>Splits left/right pages and extracts per-page fields.</div>",
-    unsafe_allow_html=True,
-)
-c2.markdown(
-    "<div style='text-align:center;'><h3>🩺</h3><b>Vitals & diagnosis</b><br/>BP / PR / RR / Temp + mental health summary.</div>",
-    unsafe_allow_html=True,
-)
-c3.markdown(
-    "<div style='text-align:center;'><h3>🔐</h3><b>PII extraction</b><br/>Names, IDs, dates, phones for redaction.</div>",
-    unsafe_allow_html=True,
-)
-c4.markdown(
-    "<div style='text-align:center;'><h3>✨</h3><b>Preprocessing</b><br/>Deskew, denoise, contrast enhance for doctor handwriting.</div>",
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    "<div style='text-align:center;color:#808080;padding:1.5rem;'>Made for OCR Pipeline Assignment – Handwritten PII Extraction</div>",
-    unsafe_allow_html=True,
-)
+        st.markdown("</div>", unsafe_allow_html=True)
