@@ -1,0 +1,32 @@
+# OCR + PII Extraction Pipeline Dependencies
+
+# Core OCR Libraries
+pytesseract==0.3.10
+easyocr==1.7.0
+
+# Image Processing
+opencv-python==4.8.1.78
+opencv-python-headless==4.8.1.78
+Pillow==10.1.0
+# numpy==1.24.3
+
+# Web Framework
+streamlit==1.28.1
+
+# Utilities
+python-dateutil==2.8.2
+
+# Additional ML Dependencies (for EasyOCR)
+torch==2.1.0
+torchvision==0.16.0
+scipy==1.11.3
+
+# Optional but recommended
+scikit-image==0.21.0
+
+# System Requirements:
+# - Python 3.8+
+# - Tesseract OCR installed on system
+#   Ubuntu/Debian: sudo apt-get install tesseract-ocr
+#   macOS: brew install tesseract
+#   Windows: Download from https://github.com/UB-Mannheim/tesseract/wiki
