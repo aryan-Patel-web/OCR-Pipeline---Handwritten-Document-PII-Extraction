@@ -1,87 +1,105 @@
 """
 main.py
-Hybrid OCR Engine for Medical / Handwritten Documents
------------------------------------------------------
-- Uses Tesseract for printed text.
-- Uses TrOCR (microsoft/trocr-base-handwritten) for pen / handwriting.
-- Works with double-page hospital scans (left + right page).
-- Outputs RAW text per page (no hardcoded Name/Age/etc).
-- Also provides simple PII detection + redacted image.
+Advanced OCR + PII / Structured Field Extraction
+Optimized for handwritten medical documents (doctor notes, progress reports, charts)
+Works with Python 3.12 – Tesseract only (no EasyOCR).
++ Optional Mistral LLM post-processing for higher accuracy.
 """
 
-import os
 import cv2
 import numpy as np
 import pytesseract
 from PIL import Image
 import re
 from typing import Dict, List, Tuple, Any
-from datetime import datetime
 import json
+from datetime import datetime
+import os
 
-import torch
-from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+from dotenv import load_dotenv
 
-# If Tesseract is not in PATH on Windows, set this:
+# ---- OPTIONAL: Mistral LLM client ----
+try:
+    from mistralai import Mistral
+    MISTRAL_AVAILABLE = True
+except ImportError:
+    MISTRAL_AVAILABLE = False
+
+# Load environment variables (MISTRAL_API_KEY from .env)
+load_dotenv()
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+
+# If Tesseract is not in PATH on Windows, uncomment and set this:
 # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 
 class MedicalDocumentOCR:
     def __init__(
         self,
-        use_tesseract: bool = True,
-        use_trocr: bool = True,
         deskew: bool = True,
         denoise: bool = True,
         enhance_contrast: bool = True,
-        trocr_grid_rows: int = 3,
-        trocr_grid_cols: int = 2,
+        use_llm: bool = False,
+        llm_model: str = "mistral-large-latest",
     ):
         """
-        Hybrid OCR:
-        - Tesseract for printed text (headers, labels, typed fields).
-        - TrOCR (base) for handwriting (blue/black pen, scribbles).
+        OCR + PII extractor focused on handwritten medical documents.
+        If use_llm=True and MISTRAL_API_KEY is set, enables optional LLM refinement.
         """
-        self.use_tesseract = use_tesseract
-        self.use_trocr = use_trocr
         self.deskew = deskew
         self.denoise = denoise
         self.enhance_contrast = enhance_contrast
-        self.trocr_grid_rows = trocr_grid_rows
-        self.trocr_grid_cols = trocr_grid_cols
 
-        # ---- Load TrOCR model (base) once ----
-        self.trocr_processor: TrOCRProcessor | None = None
-        self.trocr_model: VisionEncoderDecoderModel | None = None
+        self.use_llm = use_llm and MISTRAL_AVAILABLE and bool(MISTRAL_API_KEY)
+        self.llm_model = llm_model
 
-        if self.use_trocr:
+        # Initialize Mistral client if available and requested
+        self.llm_client = None
+        if self.use_llm:
             try:
-                self.trocr_processor = TrOCRProcessor.from_pretrained(
-                    "microsoft/trocr-base-handwritten"
-                )
-                self.trocr_model = VisionEncoderDecoderModel.from_pretrained(
-                    "microsoft/trocr-base-handwritten"
-                )
-                self.trocr_model.eval()
-                # Use CPU by default (GPU if available)
-                self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                self.trocr_model.to(self.device)
-                print("[TrOCR] Loaded microsoft/trocr-base-handwritten on", self.device)
+                self.llm_client = Mistral(api_key=MISTRAL_API_KEY)
             except Exception as e:
-                print(f"[TrOCR] Failed to load model: {e}")
-                self.use_trocr = False
+                print(f"[LLM] Failed to init Mistral client: {e}")
+                self.llm_client = None
+                self.use_llm = False
 
-        # ---- Simple PII regex for redaction (numbers, phones, emails, IDs) ----
+        # Generic PII / identifier patterns
         self.pii_patterns = {
-            "phone": r"(?:\+91[\-\s]?)?[6-9]\d{9}",
-            "email": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
-            "id_like": r"\b[0-9]{4,}\b",  # generic numbers (IPD/UHID etc)
-            "name_hint": r"(?:Mr\.?|Mrs\.?|Ms\.?|Dr\.?)\s+[A-Za-z][A-Za-z\s\.]+",
+            "patient_name": [
+                r"Patient\s*Name\s*[:\-]?\s*([A-Za-z][A-Za-z\s\.]+?)(?:\s+Age|\s+Sex|\n|$)",
+            ],
+            "age": [
+                r"Age\s*[:\-]?\s*(\d{1,3})\s*(?:yrs?|years?)?",
+            ],
+            "sex": [
+                r"Sex\s*[:\-]?\s*(M|F|Male|Female)",
+            ],
+            "ipd_number": [
+                r"IPD\s*No\.?\s*[:\-]?\s*([A-Za-z0-9\/]+)",
+                r"IP\s*No\.?\s*[:\-]?\s*([A-Za-z0-9\/]+)",
+            ],
+            "uhid_number": [
+                r"UHID\s*No\.?\s*[:\-]?\s*([A-Za-z0-9\/]+)",
+            ],
+            "bed_number": [
+                r"Bed\s*No\.?\s*[:\-]?\s*([A-Za-z0-9\/]+)",
+            ],
+            "date": [
+                r"\b\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}\b",
+            ],
+            "time": [
+                r"\b\d{1,2}[:\.]\d{2}\s*(?:AM|PM|am|pm)?\b",
+                r"\b\d{1,2}\s*(?:AM|PM|am|pm)\b",
+            ],
+            "phone": [
+                r"(?:\+91[\-\s]?)?[6-9]\d{9}",
+            ],
+            "email": [
+                r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+            ],
         }
 
-    # ------------------------------------------------------------------
-    # IMAGE PREPROCESSING
-    # ------------------------------------------------------------------
+    # ---------------------- IMAGE PREPROCESSING ---------------------- #
 
     def _deskew_image(self, img: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -95,6 +113,7 @@ class MedicalDocumentOCR:
             return img
 
         angle = cv2.minAreaRect(coords)[-1]
+
         if angle < -45:
             angle = -(90 + angle)
         else:
@@ -103,7 +122,7 @@ class MedicalDocumentOCR:
         if abs(angle) < 0.5:
             return img
 
-        h, w = img.shape[:2]
+        (h, w) = img.shape[:2]
         center = (w // 2, h // 2)
         M = cv2.getRotationMatrix2D(center, angle, 1.0)
         rotated = cv2.warpAffine(
@@ -111,67 +130,73 @@ class MedicalDocumentOCR:
         )
         return rotated
 
-    def _preprocess_for_tesseract(self, img: np.ndarray) -> List[np.ndarray]:
+    def _preprocess_page(self, img: np.ndarray) -> List[np.ndarray]:
         """
-        Create multiple processed versions of a single page for Tesseract.
+        Create multiple processed versions of a single page for OCR ensemble.
         """
         if self.deskew:
             img = self._deskew_image(img)
 
         if self.denoise:
-            img = cv2.fastNlMeansDenoisingColored(img, None, 10, 10, 7, 21)
+            img = cv2.fastNlMeansDenoisingColored(
+                img, None, 10, 10, 7, 21
+            )
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        processed: List[np.ndarray] = []
 
-        # Adaptive threshold
+        processed_images: List[np.ndarray] = []
+
+        # Adaptive threshold (handles uneven lighting)
         adaptive = cv2.adaptiveThreshold(
             gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 25, 11
+            cv2.THRESH_BINARY, 21, 10
         )
-        processed.append(adaptive)
+        processed_images.append(adaptive)
 
         # Otsu
         _, otsu = cv2.threshold(
             gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
         )
-        processed.append(otsu)
+        processed_images.append(otsu)
 
         # Morph close
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
         morph = cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, kernel)
-        processed.append(morph)
+        processed_images.append(morph)
 
-        # CLAHE contrast
+        # Contrast enhancement (CLAHE)
         if self.enhance_contrast:
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             enhanced = clahe.apply(gray)
             _, enhanced_thresh = cv2.threshold(
                 enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
             )
-            processed.append(enhanced_thresh)
+            processed_images.append(enhanced_thresh)
 
-        return processed
+        # Slight dilation for broken strokes
+        kernel_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))
+        dilated = cv2.dilate(otsu, kernel_dilate, iterations=1)
+        processed_images.append(dilated)
 
-    # ------------------------------------------------------------------
-    # TESSERACT OCR
-    # ------------------------------------------------------------------
+        return processed_images
 
-    def _ocr_tesseract(self, variants: List[np.ndarray]) -> str:
+    # ---------------------- OCR CORE ---------------------- #
+
+    def _extract_text_tesseract(self, processed_images: List[np.ndarray]) -> str:
         """
-        OCR using Tesseract with multiple configs, merge all text.
+        Extract text from multiple processed variants using several Tesseract configs.
         """
-        if not self.use_tesseract:
-            return ""
-
         all_texts: List[str] = []
+
         configs = [
             "--psm 6 --oem 3 -c preserve_interword_spaces=1",
             "--psm 4 --oem 3",
+            "--psm 3 --oem 3",
             "--psm 11 --oem 3",
+            "--psm 12 --oem 3",
         ]
 
-        for img in variants:
+        for img in processed_images:
             for cfg in configs:
                 try:
                     txt = pytesseract.image_to_string(img, lang="eng", config=cfg)
@@ -180,133 +205,273 @@ class MedicalDocumentOCR:
                 except Exception:
                     continue
 
-        return "\n".join(all_texts)
+        combined = "\n".join(all_texts)
+        return combined
 
-    # ------------------------------------------------------------------
-    # TrOCR HANDWRITING OCR
-    # ------------------------------------------------------------------
+    # ---------------------- TEXT CLEANING ---------------------- #
 
-    def _trocr_single_image(self, img_bgr: np.ndarray) -> str:
+    def clean_text(self, text: str) -> str:
         """
-        Run TrOCR on a single RGB patch (handwriting-aware).
+        Clean raw OCR text:
+        - normalize newlines
+        - remove noise characters
+        - collapse spaces
         """
-        if not self.use_trocr or self.trocr_processor is None or self.trocr_model is None:
-            return ""
-
-        # Slight upscale to help thin pen strokes
-        h, w = img_bgr.shape[:2]
-        scale = 1.3
-        img_resized = cv2.resize(
-            img_bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC
-        )
-
-        pil_img = Image.fromarray(cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB))
-
-        with torch.no_grad():
-            inputs = self.trocr_processor(pil_img, return_tensors="pt").pixel_values
-            inputs = inputs.to(self.device)
-            generated_ids = self.trocr_model.generate(
-                inputs,
-                max_length=256,
-                num_beams=3,
-            )
-            text = self.trocr_processor.batch_decode(
-                generated_ids, skip_special_tokens=True
-            )[0]
-        return text.strip()
-
-    def _ocr_trocr_grid(self, page_bgr: np.ndarray) -> str:
-        """
-        Split page into a grid and run TrOCR on each cell.
-        This dramatically increases recall for handwriting.
-        """
-        if not self.use_trocr:
-            return ""
-
-        h, w = page_bgr.shape[:2]
-        rows = self.trocr_grid_rows
-        cols = self.trocr_grid_cols
-        tile_h = h // rows
-        tile_w = w // cols
-
-        texts: List[str] = []
-
-        for r in range(rows):
-            for c in range(cols):
-                y1 = r * tile_h
-                y2 = h if r == rows - 1 else (r + 1) * tile_h
-                x1 = c * tile_w
-                x2 = w if c == cols - 1 else (c + 1) * tile_w
-                tile = page_bgr[y1:y2, x1:x2]
-                if tile.size == 0:
-                    continue
-                t = self._trocr_single_image(tile)
-                if t:
-                    texts.append(t)
-
-        return "\n".join(texts)
-
-    # ------------------------------------------------------------------
-    # TEXT CLEANING + PII
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _clean_text(text: str) -> str:
         if not text:
             return ""
+
         text = text.replace("\r\n", "\n").replace("\r", "\n")
         lines = []
         for raw in text.split("\n"):
-            # Keep most characters, just normalize spaces
-            line = re.sub(r"\s+", " ", raw).strip()
-            if len(line) > 1:
+            # keep only allowed chars
+            line = re.sub(r"[^\w\s\.\,\:\-\(\)\/\@\+]", "", raw)
+            line = re.sub(r"\s+", " ", line).strip()
+            if len(line) > 2:
                 lines.append(line)
         return "\n".join(lines)
 
-    def detect_pii(self, text: str) -> Dict[str, List[str]]:
+    # ---------------------- STRUCTURED EXTRACTION ---------------------- #
+
+    def _extract_header_metadata(self, text: str) -> Dict[str, Any]:
         """
-        Very simple PII detection for redaction.
+        Hospital name, location, form code from header.
         """
-        pii: Dict[str, List[str]] = {k: [] for k in self.pii_patterns.keys()}
+        data: Dict[str, Any] = {
+            "hospital_name": None,
+            "location": None,
+            "form_code": None,
+        }
 
-        for key, pattern in self.pii_patterns.items():
-            for m in re.finditer(pattern, text, re.IGNORECASE):
-                val = m.group(0).strip()
-                if val and val not in pii[key]:
-                    pii[key].append(val)
+        lines = text.split("\n")
 
-        return pii
+        for i, line in enumerate(lines):
+            low = line.lower()
+            if "institute of medical sciences" in low or "sum hospital" in low:
+                data["hospital_name"] = line.strip()
+                # next 1–2 lines often contain university + location
+                if i + 1 < len(lines):
+                    loc_line = lines[i + 1].strip()
+                    if any(x in loc_line.lower() for x in ["bhubaneswar", "kalinga"]):
+                        data["location"] = loc_line
+                if i + 2 < len(lines) and data["location"] is None:
+                    loc_line2 = lines[i + 2].strip()
+                    if any(x in loc_line2.lower() for x in ["bhubaneswar", "kalinga"]):
+                        data["location"] = loc_line2
 
-    # ------------------------------------------------------------------
-    # REDACTED IMAGE
-    # ------------------------------------------------------------------
+        # Form code
+        m = re.search(
+            r"FORM\s*NO\.?\s*([A-Za-z0-9\-\/]+)", text, re.IGNORECASE
+        )
+        if m:
+            data["form_code"] = m.group(1)
+
+        return data
+
+    def _extract_patient_block(self, text: str) -> Dict[str, Any]:
+        """
+        Patient name, age, sex, IPD, UHID, Bed, date, time.
+        """
+        block: Dict[str, Any] = {
+            "patient_name": None,
+            "age": None,
+            "sex": None,
+            "ipd_number": None,
+            "uhid_number": None,
+            "bed_number": None,
+            "date": None,
+            "time": None,
+        }
+
+        # Patient name
+        for pattern in self.pii_patterns["patient_name"]:
+            m = re.search(pattern, text, re.IGNORECASE)
+            if m:
+                block["patient_name"] = m.group(1).strip()
+                break
+
+        # Age
+        for pattern in self.pii_patterns["age"]:
+            m = re.search(pattern, text, re.IGNORECASE)
+            if m:
+                block["age"] = m.group(1).strip()
+                break
+
+        # Sex
+        for pattern in self.pii_patterns["sex"]:
+            m = re.search(pattern, text, re.IGNORECASE)
+            if m:
+                val = m.group(1).strip()
+                block["sex"] = val.upper()[0]  # M / F
+                break
+
+        # IPD, UHID, Bed
+        for key in ["ipd_number", "uhid_number", "bed_number"]:
+            for pattern in self.pii_patterns[key]:
+                m = re.search(pattern, text, re.IGNORECASE)
+                if m:
+                    block[key] = m.group(1).strip()
+                    break
+
+        # Date – first date we see on page
+        for pattern in self.pii_patterns["date"]:
+            m = re.search(pattern, text)
+            if m:
+                block["date"] = m.group(0)
+                break
+
+        # Time – first time we see on page
+        for pattern in self.pii_patterns["time"]:
+            m = re.search(pattern, text)
+            if m:
+                block["time"] = m.group(0)
+                break
+
+        return block
+
+    def _extract_vitals(self, text: str) -> Dict[str, Any]:
+        """
+        BP, PR, RR, Temp from vitals block.
+        """
+        vitals = {"bp": None, "pr": None, "rr": None, "temp": None}
+
+        m = re.search(
+            r"BP\s*[:\-]?\s*([0-9]{2,3}\s*\/\s*[0-9]{2,3})", text, re.IGNORECASE
+        )
+        if m:
+            vitals["bp"] = m.group(1).replace(" ", "")
+
+        m = re.search(
+            r"PR\s*[:\-]?\s*([0-9]{2,3})", text, re.IGNORECASE
+        )
+        if m:
+            vitals["pr"] = m.group(1)
+
+        m = re.search(
+            r"RR\s*[:\-]?\s*([0-9]{1,3})", text, re.IGNORECASE
+        )
+        if m:
+            vitals["rr"] = m.group(1)
+
+        m = re.search(
+            r"(?:T|Temp)\s*[:\-]?\s*([0-9]{2,3}\s*(?:[CF]|°C|°F)?)",
+            text,
+            re.IGNORECASE,
+        )
+        if m:
+            vitals["temp"] = m.group(1).replace(" ", "")
+
+        return vitals
+
+    def _extract_clinical_summary(self, text: str) -> str:
+        """
+        Pull out the key diagnosis / narrative (e.g. 'Mental and behavioural disorder...').
+        """
+        lines = text.split("\n")
+        key_lines: List[str] = []
+
+        for line in lines:
+            low = line.lower()
+            if any(
+                kw in low
+                for kw in [
+                    "mental and behavioural",
+                    "behavioural disorder",
+                    "dependence syndrome",
+                    "diagnosis",
+                    "alcohol",
+                ]
+            ):
+                key_lines.append(line.strip())
+
+        # Fallback: first long line from PROGRESS NOTES section
+        if not key_lines:
+            capture = False
+            for line in lines:
+                low = line.lower()
+                if "progress notes" in low:
+                    capture = True
+                    continue
+                if capture and len(line) > 40:
+                    key_lines.append(line.strip())
+                    if len(key_lines) >= 3:
+                        break
+
+        return " ".join(key_lines) if key_lines else ""
+
+    # ---------------------- GENERIC PII FOR REDACTION ---------------------- #
+
+    def extract_pii_for_redaction(self, text: str) -> Dict[str, List[str]]:
+        """
+        Generic PII list for redaction (names, IDs, dates, phones, emails).
+        """
+        pii_data: Dict[str, List[str]] = {
+            "patient_name": [],
+            "age": [],
+            "sex": [],
+            "ipd_number": [],
+            "uhid_number": [],
+            "bed_number": [],
+            "dates": [],
+            "times": [],
+            "phone_numbers": [],
+            "emails": [],
+        }
+
+        for type_key, patterns in self.pii_patterns.items():
+            for pattern in patterns:
+                for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE):
+                    if match.groups():
+                        value = match.group(1).strip()
+                    else:
+                        value = match.group(0).strip()
+
+                    if not value:
+                        continue
+
+                    if type_key == "date":
+                        pii_data["dates"].append(value)
+                    elif type_key == "time":
+                        pii_data["times"].append(value)
+                    elif type_key == "phone":
+                        pii_data["phone_numbers"].append(value)
+                    elif type_key == "email":
+                        pii_data["emails"].append(value)
+                    else:
+                        if type_key in pii_data:
+                            pii_data[type_key].append(value)
+
+        # deduplicate
+        for key in pii_data:
+            pii_data[key] = sorted(list(set(pii_data[key])))
+
+        return pii_data
+
+    # ---------------------- REDACTED IMAGE ---------------------- #
 
     def create_redacted_image(
-        self, image_path: str, pii_tokens: List[str]
+        self, image_path: str, pii_strings: List[str]
     ) -> np.ndarray | None:
         """
-        Use Tesseract word-level boxes to blackout PII tokens.
+        Create a redacted image where any OCR word matching PII strings is blacked out.
         """
         img = cv2.imread(image_path)
         if img is None:
             return None
 
-        if not pii_tokens:
-            return img
-
+        # Basic preprocessing once for bbox detection
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        _, thr = cv2.threshold(
+        _, thresh = cv2.threshold(
             gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
         )
 
         try:
             data = pytesseract.image_to_data(
-                thr, output_type=pytesseract.Output.DICT
+                thresh, output_type=pytesseract.Output.DICT
             )
         except Exception:
             return img
 
-        pii_lower = [p.lower() for p in pii_tokens if p]
+        pii_lower = [p.lower() for p in pii_strings if p]
 
         for i, word in enumerate(data["text"]):
             if not word or word.strip() == "":
@@ -315,7 +480,10 @@ class MedicalDocumentOCR:
                 continue
 
             w_low = word.lower()
-            if any(w_low in p or p in w_low for p in pii_lower):
+            should_redact = any(
+                w_low in pii_val or pii_val in w_low for pii_val in pii_lower
+            )
+            if should_redact:
                 x, y, w, h = (
                     data["left"][i],
                     data["top"][i],
@@ -326,125 +494,235 @@ class MedicalDocumentOCR:
 
         return img
 
-    # ------------------------------------------------------------------
-    # PAGE SPLITTING + MAIN PIPELINE
-    # ------------------------------------------------------------------
-
-    def _split_pages(self, img: np.ndarray) -> List[Tuple[str, np.ndarray]]:
-        """
-        If width >> height, treat as left+right page.
-        """
-        h, w = img.shape[:2]
-        pages: List[Tuple[str, np.ndarray]] = []
-        if w > 1.1 * h:
-            mid = w // 2
-            left = img[:, :mid]
-            right = img[:, mid:]
-            pages.append(("left", left))
-            pages.append(("right", right))
-        else:
-            pages.append(("single", img))
-        return pages
+    # ---------------------- MAIN ENTRY (OCR ONLY) ---------------------- #
 
     def process_document(self, image_path: str) -> Dict[str, Any]:
+        """
+        Full pipeline (OCR-based only, no LLM here):
+        - detect single vs double page
+        - OCR per page
+        - clean text
+        - structured field extraction per page
+        - global PII list
+        - optional redacted image
+        """
         if not os.path.exists(image_path):
             raise FileNotFoundError(image_path)
 
-        full_img = cv2.imread(image_path)
-        if full_img is None:
+        color_img = cv2.imread(image_path)
+        if color_img is None:
             raise ValueError(f"Cannot read image: {image_path}")
 
-        pages = self._split_pages(full_img)
+        h, w = color_img.shape[:2]
+
+        # Heuristic: if width >> height, assume left/right pages.
+        pages: List[Tuple[str, np.ndarray]] = []
+        if w > 1.1 * h:
+            mid = w // 2
+            left = color_img[:, :mid]
+            right = color_img[:, mid:]
+            pages.append(("left", left))
+            pages.append(("right", right))
+        else:
+            pages.append(("single", color_img))
 
         page_results: List[Dict[str, Any]] = []
-        combined_text_all_parts: List[str] = []
+        combined_cleaned_text_parts: List[str] = []
 
         for side, page_img in pages:
-            # Tesseract
-            tess_raw = ""
-            tess_clean = ""
-            if self.use_tesseract:
-                tess_variants = self._preprocess_for_tesseract(page_img)
-                tess_raw = self._ocr_tesseract(tess_variants)
-                tess_clean = self._clean_text(tess_raw)
+            processed_variants = self._preprocess_page(page_img)
+            raw_text = self._extract_text_tesseract(processed_variants)
+            cleaned_text = self.clean_text(raw_text)
 
-            # TrOCR
-            trocr_text = ""
-            if self.use_trocr:
-                trocr_text = self._ocr_trocr_grid(page_img)
-                trocr_text = self._clean_text(trocr_text)
+            header_meta = self._extract_header_metadata(cleaned_text)
+            patient_block = self._extract_patient_block(cleaned_text)
+            vitals = self._extract_vitals(cleaned_text)
+            clinical_summary = self._extract_clinical_summary(cleaned_text)
 
-            combined_page_text = ""
-            if tess_clean:
-                combined_page_text += "[TESSERACT]\n" + tess_clean + "\n"
-            if trocr_text:
-                combined_page_text += "[HANDWRITING]\n" + trocr_text
-
-            combined_page_text = combined_page_text.strip()
-
-            page_results.append(
-                {
-                    "side": side,
-                    "tesseract_text": tess_clean,
-                    "trocr_text": trocr_text,
-                    "combined_text": combined_page_text,
-                }
-            )
-            combined_text_all_parts.append(
-                f"[{side.upper()} PAGE]\n{combined_page_text}"
+            page_info = {
+                "side": side,
+                "raw_text": raw_text,
+                "cleaned_text": cleaned_text,
+                "fields": {
+                    **header_meta,
+                    **patient_block,
+                    "vitals": vitals,
+                    "clinical_summary": clinical_summary,
+                },
+            }
+            page_results.append(page_info)
+            combined_cleaned_text_parts.append(
+                f"[{side.upper()} PAGE]\n{cleaned_text}"
             )
 
-        combined_text_all = "\n\n".join(combined_text_all_parts)
+        combined_cleaned_text = "\n\n".join(combined_cleaned_text_parts)
 
-        # PII for redaction (simple)
-        pii = self.detect_pii(combined_text_all)
-        pii_tokens_flat: List[str] = []
-        for vals in pii.values():
-            pii_tokens_flat.extend(vals)
+        # Global PII for redaction
+        pii_for_redaction = self.extract_pii_for_redaction(combined_cleaned_text)
 
-        redacted_image = self.create_redacted_image(image_path, pii_tokens_flat)
+        # Flatten PII strings for redaction
+        pii_strings_for_image: List[str] = []
+        for vals in pii_for_redaction.values():
+            pii_strings_for_image.extend(vals)
+
+        redacted_image = self.create_redacted_image(
+            image_path, pii_strings_for_image
+        )
+
+        timestamp = datetime.now().isoformat()
 
         summary = {
+            "total_pii_found": sum(len(v) for v in pii_for_redaction.values()),
+            "pii_categories": [
+                key for key, vals in pii_for_redaction.items() if vals
+            ],
             "pages_detected": len(pages),
-            "total_pii_found": sum(len(v) for v in pii.values()),
-            "pii_categories": [k for k, v in pii.items() if v],
         }
 
         results: Dict[str, Any] = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": timestamp,
             "image_path": image_path,
             "pages": page_results,
-            "combined_text_all": combined_text_all,
-            "pii": pii,
+            "cleaned_text": combined_cleaned_text,
+            "pii_extracted": pii_for_redaction,
             "redacted_image": redacted_image,
             "summary": summary,
         }
+
         return results
+
+    # ---------------------- LLM POST-PROCESSING ---------------------- #
+
+    def enhance_with_llm(self, ocr_results: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Use Mistral LLM to refine / correct the OCR-based structured fields.
+        Returns a new dict with key 'llm_enhanced' added.
+        """
+        if not self.use_llm or self.llm_client is None:
+            print("[LLM] Mistral not enabled or not available.")
+            ocr_results["llm_enhanced"] = None
+            return ocr_results
+
+        # Build compact payload for LLM
+        pages_payload = []
+        for page in ocr_results.get("pages", []):
+            pages_payload.append({
+                "side": page.get("side"),
+                "fields": page.get("fields"),
+                "cleaned_text": page.get("cleaned_text"),
+            })
+
+        user_payload = {
+            "pages": pages_payload
+        }
+
+        system_prompt = (
+            "You are an expert medical document reader for Indian hospital case sheets. "
+            "You receive noisy OCR text + rough extracted fields from handwritten forms. "
+            "Your job is to correct and complete the structured data ONLY using what is clearly "
+            "present or strongly implied in the text. If a value is unknown, set it to null.\n\n"
+            "Return STRICT JSON with this structure:\n"
+            "{\n"
+            '  "pages": [\n'
+            "    {\n"
+            '      "side": \"left\" | \"right\" | \"single\",\n'
+            '      "hospital_name": string|null,\n'
+            '      "location": string|null,\n'
+            '      "form_code": string|null,\n'
+            '      "patient_name": string|null,\n'
+            '      "age": string|null,\n'
+            '      "sex": "M" | "F" | null,\n'
+            '      "ipd_number": string|null,\n'
+            '      "uhid_number": string|null,\n'
+            '      "bed_number": string|null,\n'
+            '      "date": string|null,\n'
+            '      "time": string|null,\n'
+            '      "vitals": {\n'
+            '          "bp": string|null,\n'
+            '          "pr": string|null,\n'
+            '          "rr": string|null,\n'
+            '          "temp": string|null\n'
+            "      },\n"
+            '      "clinical_summary": string|null\n'
+            "    }\n"
+            "  ]\n"
+            "}\n\n"
+            "Important:\n"
+            "- Use EXACT JSON (no comments, no extra text).\n"
+            "- Do not invent hospitals or people; stay close to the OCR text.\n"
+            "- Normalize vitals like BP to '154/94', temperature to '98 F' or '37 C' if clearly read.\n"
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "user",
+                "content": "Here is the noisy OCR extraction:\n\n" + json.dumps(user_payload, indent=2),
+            },
+        ]
+
+        try:
+            resp = self.llm_client.chat.complete(
+                model=self.llm_model,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=512,
+            )
+            content = resp.choices[0].message["content"] if isinstance(
+                resp.choices[0].message, dict
+            ) else resp.choices[0].message.content
+
+            # Some SDKs return list of chunks; here we assume string
+            content = content.strip()
+            # In case the model wraps JSON in ```json ... ```
+            if content.startswith("```"):
+                content = re.sub(r"^```[a-zA-Z]*", "", content)
+                content = content.strip("` \n")
+
+            llm_data = json.loads(content)
+            ocr_results["llm_enhanced"] = llm_data
+        except Exception as e:
+            print(f"[LLM] Error calling Mistral or parsing JSON: {e}")
+            ocr_results["llm_enhanced"] = None
+
+        return ocr_results
 
 
 # Simple CLI test
-def test_pipeline(image_path: str):
-    ocr = MedicalDocumentOCR()
-    res = ocr.process_document(image_path)
+def test_pipeline(image_path: str, use_llm: bool = False):
+    ocr = MedicalDocumentOCR(use_llm=use_llm)
+    results = ocr.process_document(image_path)
+    if use_llm:
+        results = ocr.enhance_with_llm(results)
 
-    print("\n===== COMBINED TEXT (first 1000 chars) =====")
-    print(res["combined_text_all"][:1000])
-    print("\n===== SUMMARY =====")
-    print(json.dumps(res["summary"], indent=2))
-    print("\n===== PII =====")
-    print(json.dumps(res["pii"], indent=2))
+    print("\n" + "=" * 80)
+    print("CLEANED TEXT (first 800 chars)")
+    print("=" * 80)
+    print(results["cleaned_text"][:800])
+    print("\n" + "=" * 80)
+    print("PII / STRUCTURED DATA (OCR only)")
+    print("=" * 80)
+    print(json.dumps(results["pii_extracted"], indent=2))
+    if results.get("llm_enhanced"):
+        print("\nLLM-ENHANCED STRUCTURED FIELDS:")
+        print(json.dumps(results["llm_enhanced"], indent=2))
+    print("\nSUMMARY:")
+    print(json.dumps(results["summary"], indent=2))
 
-    for p in res["pages"]:
-        print(f"\n--- PAGE: {p['side']} ---")
-        print("Tesseract snippet:", p["tesseract_text"][:200])
-        print("TrOCR snippet:", p["trocr_text"][:200])
+    for page in results["pages"]:
+        print("\n--- PAGE:", page["side"], "(OCR fields) ---")
+        print(json.dumps(page["fields"], indent=2))
 
-    return res
+    return results
 
 
 if __name__ == "__main__":
+    # Replace with a real JPEG path when testing locally
     sample = "sample_page.jpg"
     if os.path.exists(sample):
-        test_pipeline(sample)
+        test_pipeline(sample, use_llm=True)
     else:
         print("Put a test image as 'sample_page.jpg' to run main.py directly.")
